@@ -1,90 +1,90 @@
-#!/usr/bin/env python3
-import io
-from datetime import date, datetime
 import pandas as pd
-import streamlit as st
+import requests
+import yfinance as yf
+from datetime import datetime, date
 
-from backtest import run_backtest, summary_metrics, equity_curves
-from data import get_fgi_history, get_btc_history, align_series
-from utils import fmt_money, fmt_pct
+def _empty_fgi_df():
+    # DataFrame vazio com índice datetime nomeado "date" e coluna FGI float
+    return pd.DataFrame({"FGI": pd.Series(dtype="float")}).set_index(
+        pd.DatetimeIndex([], name="date")
+    )
 
-st.set_page_config(page_title="BTC Fear & Greed Backtest", layout="wide")
+def get_fgi_history() -> pd.DataFrame:
+    """
+    Baixa histórico do Fear & Greed Index (FGI) em formato JSON.
+    Retorna DF com índice 'date' (datetime) e coluna 'FGI' (float).
+    Em caso de falha/sem dados, retorna DF vazio (não quebra o app).
+    """
+    url = "https://api.alternative.me/fng/"
+    params = {"limit": 0, "format": "json", "date_format": "us"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; FGI-Backtest/1.0; +https://example.com)"
+    }
 
-st.title("📈 Backtest BTC usando Fear & Greed Index")
-st.caption("Estratégia: comprar quando FGI < limiar de 'medo' e vender quando FGI > limiar de 'ganância'. Dados diários.")
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        data = payload.get("data", [])
+        if not data:
+            # Sem dados retornados
+            return _empty_fgi_df()
 
-with st.sidebar:
-    st.header("Parâmetros")
-    start = st.date_input("Data inicial", value=date(2018, 2, 1), help="O FGI tem histórico a partir de 2018.")
-    end = st.date_input("Data final", value=date.today())
-    buy_th = st.number_input("Comprar quando FGI < ", value=30, min_value=0, max_value=49, step=1)
-    sell_th = st.number_input("Vender quando FGI > ", value=70, min_value=51, max_value=100, step=1)
-    initial_capital = st.number_input("Capital inicial (USD)", value=10000.0, min_value=10.0, step=100.0, format="%.2f")
-    trade_on_close = st.selectbox("Preço p/ executar ordens", ["Fechamento do dia (close)", "Abertura do dia seguinte (open)"])
-    trade_on_close = (trade_on_close == "Fechamento do dia (close)")
-    reinvest = st.checkbox("Reinvestir 100% do capital a cada sinal (sem fracionar)", value=True)
-    fee_bps = st.number_input("Taxa por trade (bps)", value=10, min_value=0, max_value=2000, help="1 bps = 0,01%. Ex.: 10 bps = 0,10% por operação.")
-    st.markdown("---")
-    st.caption("Dica: ajuste limiares (ex.: <25 / >75) e compare com Buy&Hold.")
+        rows = []
+        for d in data:
+            # Esperado: d["timestamp"] e d["value"]
+            ts = d.get("timestamp")
+            val = d.get("value")
+            if ts is None or val is None:
+                continue
+            try:
+                ts_int = int(ts)
+                day = datetime.utcfromtimestamp(ts_int).date()
+                rows.append({"date": pd.to_datetime(day), "FGI": float(val)})
+            except Exception:
+                # Pula entradas inesperadas
+                continue
 
-st.info("Buscando dados históricos do Fear & Greed Index e do preço do BTC...")
-fgi = get_fgi_history()
-px = get_btc_history(start, end)
-df = align_series(fgi, px, start, end)
+        if not rows:
+            return _empty_fgi_df()
 
-if df.empty:
-    st.error("Sem dados no intervalo selecionado.")
-    st.stop()
+        fgi = (
+            pd.DataFrame(rows)
+            .drop_duplicates(subset=["date"])
+            .sort_values("date")
+            .set_index("date")
+        )
+        # Garante tipo float
+        fgi["FGI"] = fgi["FGI"].astype(float)
+        return fgi
 
-st.subheader("Amostra de dados")
-st.dataframe(df.head(10))
+    except Exception:
+        # Em qualquer erro de rede/JSON, retorna vazio
+        return _empty_fgi_df()
 
-st.subheader("Regras da estratégia")
-st.write(f"• **Compra** quando FGI < **{buy_th}**  • **Venda** quando FGI > **{sell_th}**  • Execução: {'close' if trade_on_close else 'next open'}  • Taxa: {fee_bps} bps")
+def get_btc_history(start: date, end: date) -> pd.DataFrame:
+    """
+    Preço diário do BTC-USD via Yahoo Finance (yfinance).
+    Retorna colunas Open/Close e índice por dia (datetime).
+    """
+    ticker = yf.Ticker("BTC-USD")
+    df = ticker.history(start=start, end=end)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Open", "Close"])
 
-# Rodar backtest
-trades, portfolio = run_backtest(
-    df=df,
-    buy_th=buy_th,
-    sell_th=sell_th,
-    initial_capital=initial_capital,
-    trade_on_close=trade_on_close,
-    reinvest=reinvest,
-    fee_bps=fee_bps
-)
+    df = df.rename(columns={"Open": "Open", "Close": "Close"})
+    # Usa somente a data (diário)
+    df.index = pd.to_datetime(df.index.date)
+    return df[["Open", "Close"]].dropna()
 
-# Métricas
-metrics = summary_metrics(portfolio, df["Close"], initial_capital)
-metrics["n_trades"] = len(trades)
+def align_series(fgi: pd.DataFrame, px: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """
+    Alinha séries por data (inner join) e recorta intervalo solicitado.
+    Se alguma vier vazia, o resultado tende a ser vazio (tratado no app).
+    """
+    if fgi is None or fgi.empty or px is None or px.empty:
+        return pd.DataFrame(columns=["Open", "Close", "FGI"])
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Retorno Estrat.", fmt_pct(metrics['strategy_return']), fmt_pct(metrics['strategy_cagr'], suffix=" a.a."))
-col2.metric("Retorno Buy&Hold", fmt_pct(metrics['bh_return']), fmt_pct(metrics['bh_cagr'], suffix=" a.a."))
-col3.metric("Máx. Drawdown (Estrat.)", fmt_pct(metrics['strategy_mdd']))
-col4.metric("Nº de trades", f"{int(metrics['n_trades'])}")
-
-# Curvas de capital
-st.subheader("Curva de capital")
-curves = equity_curves(portfolio, df["Close"], initial_capital)
-st.line_chart(curves)
-
-with st.expander("Ver operações (trades)"):
-    st.dataframe(trades)
-
-# Downloads
-st.subheader("Exportar resultados")
-def to_excel_bytes(trades_df, portfolio_df, curves_df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        trades_df.to_excel(writer, sheet_name="trades", index=False)
-        portfolio_df.to_excel(writer, sheet_name="portfolio", index=True)
-        curves_df.to_excel(writer, sheet_name="equity_curves", index=True)
-    return output.getvalue()
-
-excel_bytes = to_excel_bytes(trades, portfolio, curves)
-st.download_button("Baixar Excel (trades + carteira + curvas)", data=excel_bytes, file_name="fgi_backtest.xlsx")
-
-csv_trades = trades.to_csv(index=False).encode("utf-8")
-st.download_button("Baixar Trades (CSV)", data=csv_trades, file_name="trades.csv")
-
-st.caption("Aviso: backtests não garantem resultados futuros. Use como estudo de caso/educacional.")
+    df = px.join(fgi, how="inner")
+    df = df.loc[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
+    return df
